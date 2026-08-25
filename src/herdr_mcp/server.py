@@ -175,6 +175,9 @@ def read_pane(pane: str, lines: int | None = None, source: str = "recent") -> st
     source: visible (what the user sees), recent (default scrollback tail),
     recent-unwrapped (recent without soft wrapping), detection (bottom buffer
     used for agent detection).
+    Note: herdr may return an empty string for source=recent with lines set on
+    panes with short scrollback; if that happens, retry without lines or with
+    source="visible".
     """
     _one_of("source", source, READ_SOURCES)
     args = ["pane", "read", pane, "--format", "text", "--source", source]
