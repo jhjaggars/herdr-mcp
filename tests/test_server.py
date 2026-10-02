@@ -222,3 +222,63 @@ async def test_scope_is_rechecked_per_call(server, stub) -> None:
 def test_no_prints_in_server_module() -> None:
     source = Path(__file__).resolve().parents[1] / "src" / "herdr_mcp" / "server.py"
     assert "print(" not in source.read_text()
+
+
+@pytest.fixture
+def images(server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / "capture"
+    root.mkdir()
+    (root / "f0001.png").write_bytes(b"\x89PNG-old")
+    (root / "f0002.png").write_bytes(b"\x89PNG-new")
+    (root / "notes.txt").write_text("secret")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"\x89PNG-outside")
+    (root / "escape.png").symlink_to(outside)
+    import os
+
+    os.utime(root / "f0001.png", (1, 1))
+    monkeypatch.setenv("HERDR_MCP_IMAGE_DIRS", str(root))
+    return server(tools="read,images"), root, outside
+
+
+async def test_list_images_newest_first_and_skips_non_images(images) -> None:
+    mod, root, _ = images
+    async with Client(mod.mcp) as client:
+        result = await client.call_tool("list_images", {})
+    names = [Path(i["path"]).name for i in result.structured_content["images"]]
+    assert names == ["f0002.png", "f0001.png"]  # no notes.txt, no escaping symlink
+
+
+async def test_get_image_returns_image_content(images) -> None:
+    mod, root, _ = images
+    async with Client(mod.mcp) as client:
+        result = await client.call_tool("get_image", {"path": str(root / "f0002.png")})
+    assert result.is_error is False
+    assert result.content[0].type == "image"
+    assert result.content[0].mime_type == "image/png"
+
+
+@pytest.mark.parametrize("target", ["notes.txt", "escape.png", "../outside.png", "missing.png"])
+async def test_get_image_rejects_non_images_and_escapes(images, target: str) -> None:
+    mod, root, _ = images
+    async with Client(mod.mcp) as client:
+        result = await client.call_tool("get_image", {"path": str(root / target)})
+    assert result.is_error is True
+    assert "not an image in an allowed directory" in result.content[0].text
+
+
+async def test_get_image_enforces_size_cap(images, monkeypatch) -> None:
+    mod, root, _ = images
+    monkeypatch.setenv("HERDR_MCP_IMAGE_MAX_BYTES", "4")
+    async with Client(mod.mcp) as client:
+        result = await client.call_tool("get_image", {"path": str(root / "f0002.png")})
+    assert result.is_error is True
+    assert "limit" in result.content[0].text
+
+
+async def test_images_without_dirs_fails_closed(server, monkeypatch) -> None:
+    monkeypatch.delenv("HERDR_MCP_IMAGE_DIRS", raising=False)
+    async with Client(server(tools="images").mcp) as client:
+        result = await client.call_tool("list_images", {})
+    assert result.is_error is True
+    assert "HERDR_MCP_IMAGE_DIRS" in result.content[0].text

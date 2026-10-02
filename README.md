@@ -107,7 +107,7 @@ This fork is **scoped and fail-closed**. No auth, local stdio only, but:
   aliases are rejected, so the string passed to herdr is always one we just
   listed. Moving a pane out of the workspace revokes access immediately.
 - Only the `read` tool group is registered by default. Opt in to more with
-  `HERDR_MCP_TOOLS` (`read,prompt,input,layout`). `input` (send_text, send_keys,
+  `HERDR_MCP_TOOLS` (`read,prompt,input,layout,images`). `images` serves png/jpeg/webp/gif only, from `HERDR_MCP_IMAGE_DIRS`. `input` (send_text, send_keys,
   run_command) is arbitrary code execution in the in-scope panes.
 
 Labels are not unique in herdr; every workspace carrying an allowed label is in
@@ -121,6 +121,8 @@ reach the socket directly bypasses it, so don't mount the socket into the client
 | `HERDR_BIN` | `herdr` | Path to the herdr binary. |
 | `HERDR_MCP_WORKSPACES` | *(required)* | Comma-separated workspace ids or labels in scope. |
 | `HERDR_MCP_TOOLS` | `read` | Comma-separated tool groups: `read`, `prompt`, `input`, `layout`. |
+| `HERDR_MCP_IMAGE_DIRS` | *(required with `images`)* | Colon-separated dirs `list_images`/`get_image` may serve from. Symlinks and `..` escaping them are refused. |
+| `HERDR_MCP_IMAGE_MAX_BYTES` | `5242880` | Per-image size cap. |
 | `HERDR_MCP_LOG_LEVEL` | `WARNING` | Python log level (stderr). |
 
 Everything else in the environment is passed through untouched, which is how the

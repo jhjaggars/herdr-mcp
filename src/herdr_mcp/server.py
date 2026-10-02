@@ -14,9 +14,11 @@ import json
 import logging
 import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Image
 from mcp.server.mcpserver.exceptions import ToolError
 
 logger = logging.getLogger("herdr_mcp")
@@ -30,7 +32,13 @@ ENV_WORKSPACES = "HERDR_MCP_WORKSPACES"
 ENV_TOOLS = "HERDR_MCP_TOOLS"
 #: read: list/get/read/wait. prompt: prompt_agent. input: send_text/send_keys/
 #: run_command. layout: split_pane/close_pane.
-TOOL_GROUPS = ("read", "prompt", "input", "layout")
+#: images: list_images/get_image over HERDR_MCP_IMAGE_DIRS only.
+TOOL_GROUPS = ("read", "prompt", "input", "layout", "images")
+#: Colon-separated directories image tools may serve from (required for ``images``).
+ENV_IMAGE_DIRS = "HERDR_MCP_IMAGE_DIRS"
+#: Per-image size cap in bytes (default 5 MiB).
+ENV_IMAGE_MAX_BYTES = "HERDR_MCP_IMAGE_MAX_BYTES"
+IMAGE_SUFFIXES = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".webp": "webp", ".gif": "gif"}
 
 #: Snapshot sources accepted by ``herdr pane read``.
 READ_SOURCES = ("visible", "recent", "recent-unwrapped", "detection")
@@ -185,6 +193,30 @@ def _tool(group: str):
     if group in _enabled_groups():
         return mcp.tool()
     return lambda fn: fn
+
+
+def _image_dirs() -> list[Path]:
+    raw = os.environ.get(ENV_IMAGE_DIRS, "")
+    dirs = [Path(d).expanduser().resolve() for d in raw.split(":") if d.strip()]
+    if not dirs:
+        raise ToolError(f"{ENV_IMAGE_DIRS} is not set; refusing to serve any file")
+    return dirs
+
+
+def _image_allowed(path: Path, dirs: list[Path]) -> Path | None:
+    """Resolved path if it is an image file inside an allowed dir, else None.
+
+    Resolving first means symlinks and ``..`` that escape the allowlist are caught.
+    """
+    try:
+        real = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if real.suffix.lower() not in IMAGE_SUFFIXES or not real.is_file():
+        return None
+    if not any(real.is_relative_to(d) for d in dirs):
+        return None
+    return real
 
 
 # --------------------------------------------------------------------------
@@ -411,10 +443,55 @@ def close_pane(pane: str) -> dict[str, Any]:
     return _herdr("pane", "close", _require_pane(pane))
 
 
+# --------------------------------------------------------------------------
+# Images
+# --------------------------------------------------------------------------
+
+
+@_tool("images")
+def list_images(limit: int = 20) -> dict[str, Any]:
+    """List the newest image files in the allowed directories (newest first).
+
+    Pass an entry's `path` to get_image. limit: 1-100.
+    """
+    dirs = _image_dirs()
+    if not 1 <= limit <= 100:
+        raise ToolError("limit must be between 1 and 100")
+    found = []
+    for d in dirs:
+        for candidate in d.rglob("*"):
+            real = _image_allowed(candidate, dirs)
+            if real is not None:
+                st = real.stat()
+                found.append(
+                    {"path": str(real), "bytes": st.st_size, "modified": st.st_mtime}
+                )
+    found.sort(key=lambda i: i["modified"], reverse=True)
+    return {"images": found[:limit]}
+
+
+@_tool("images")
+def get_image(path: str) -> Image:
+    """Return one image (png, jpeg, webp, gif) from the allowed directories.
+
+    path: an absolute path from list_images.
+    """
+    dirs = _image_dirs()
+    real = _image_allowed(Path(path), dirs)
+    if real is None:
+        raise ToolError(f"{path!r} is not an image in an allowed directory")
+    cap = int(os.environ.get(ENV_IMAGE_MAX_BYTES, str(5 * 1024 * 1024)))
+    if real.stat().st_size > cap:
+        raise ToolError(f"image exceeds the {cap}-byte limit")
+    return Image(data=real.read_bytes(), format=IMAGE_SUFFIXES[real.suffix.lower()])
+
+
 def main() -> None:
     """Entry point: serve MCP over stdio."""
     logging.basicConfig(level=os.environ.get("HERDR_MCP_LOG_LEVEL", "WARNING"))
     _scope_entries()  # fail closed at startup, not on the first call
+    if "images" in _enabled_groups():
+        _image_dirs()
     mcp.run()
 
 
