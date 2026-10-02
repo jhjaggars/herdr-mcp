@@ -80,7 +80,7 @@ Agent tools accept a pane id or an agent name. Every tool returns the parsed
 | `list_tabs` | List tabs across the session. |
 | `list_panes` | List panes with ids, workspace, tab, cwd, title, agent status. |
 | `list_agents` | List panes running a detected agent, with kind and status. |
-| `get_agent` | Show one agent's current state. |
+| `get_agent` | Show one agent's current state (pane id only). |
 | `read_pane` | Read pane output as text (`source`: visible, recent, recent-unwrapped, detection). |
 | `prompt_agent` | Submit a prompt to an agent, optionally waiting until it settles. |
 | `wait_agent` | Wait until an agent reaches idle/working/blocked/done/unknown. |
@@ -97,16 +97,30 @@ itself.
 
 ## Security
 
-No auth, no sandbox, local stdio only. Any client that can start this server can
-run arbitrary commands in your terminal panes and read everything on screen,
-including whatever an agent pane is displaying. Only wire it up to clients you
-trust on your own machine.
+This fork is **scoped and fail-closed**. No auth, local stdio only, but:
+
+- `HERDR_MCP_WORKSPACES` is required; the server refuses to start without it.
+  It lists workspace ids (`wS`) and/or labels (`openclaw`) the client may touch.
+- Listings (`list_*`) are filtered to those workspaces.
+- Every pane argument is re-checked against a fresh `pane list` on every call and
+  must exactly equal an in-scope `pane_id`. Agent names, terminal ids and other
+  aliases are rejected, so the string passed to herdr is always one we just
+  listed. Moving a pane out of the workspace revokes access immediately.
+- Only the `read` tool group is registered by default. Opt in to more with
+  `HERDR_MCP_TOOLS` (`read,prompt,input,layout`). `input` (send_text, send_keys,
+  run_command) is arbitrary code execution in the in-scope panes.
+
+Labels are not unique in herdr; every workspace carrying an allowed label is in
+scope. This is not a sandbox against the herdr socket itself: anything that can
+reach the socket directly bypasses it, so don't mount the socket into the client.
 
 ## Environment
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HERDR_BIN` | `herdr` | Path to the herdr binary. |
+| `HERDR_MCP_WORKSPACES` | *(required)* | Comma-separated workspace ids or labels in scope. |
+| `HERDR_MCP_TOOLS` | `read` | Comma-separated tool groups: `read`, `prompt`, `input`, `layout`. |
 | `HERDR_MCP_LOG_LEVEL` | `WARNING` | Python log level (stderr). |
 
 Everything else in the environment is passed through untouched, which is how the

@@ -23,6 +23,15 @@ logger = logging.getLogger("herdr_mcp")
 
 mcp = MCPServer("herdr")
 
+#: Comma-separated workspace ids (``wS``) or labels this server may touch. Required:
+#: with it unset the server refuses to start and every tool call fails closed.
+ENV_WORKSPACES = "HERDR_MCP_WORKSPACES"
+#: Comma-separated tool groups to register. Default is read-only.
+ENV_TOOLS = "HERDR_MCP_TOOLS"
+#: read: list/get/read/wait. prompt: prompt_agent. input: send_text/send_keys/
+#: run_command. layout: split_pane/close_pane.
+TOOL_GROUPS = ("read", "prompt", "input", "layout")
+
 #: Snapshot sources accepted by ``herdr pane read``.
 READ_SOURCES = ("visible", "recent", "recent-unwrapped", "detection")
 #: Snapshot sources accepted by ``herdr pane wait-output`` (no detection buffer).
@@ -119,54 +128,125 @@ def _one_of(name: str, value: str, allowed: tuple[str, ...]) -> str:
 
 
 # --------------------------------------------------------------------------
+# Scope enforcement
+# --------------------------------------------------------------------------
+
+
+def _enabled_groups() -> set[str]:
+    raw = os.environ.get(ENV_TOOLS, "read")
+    groups = {g.strip() for g in raw.split(",") if g.strip()}
+    unknown = groups - set(TOOL_GROUPS)
+    if unknown:
+        raise ValueError(
+            f"{ENV_TOOLS}: unknown group(s) {sorted(unknown)}; allowed {TOOL_GROUPS}"
+        )
+    return groups
+
+
+def _scope_entries() -> set[str]:
+    raw = os.environ.get(ENV_WORKSPACES, "")
+    entries = {e.strip() for e in raw.split(",") if e.strip()}
+    if not entries:
+        raise ToolError(f"{ENV_WORKSPACES} is not set; refusing to expose any pane")
+    return entries
+
+
+def _scoped_workspace_ids() -> set[str]:
+    """Workspace ids currently matching the configured ids/labels (never cached)."""
+    entries = _scope_entries()
+    listing = _herdr("workspace", "list")
+    return {
+        w["workspace_id"]
+        for w in listing.get("workspaces", [])
+        if w.get("workspace_id") in entries or w.get("label") in entries
+    }
+
+
+def _scoped(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ids = _scoped_workspace_ids()
+    return [i for i in items if i.get("workspace_id") in ids]
+
+
+def _require_pane(pane: str) -> str:
+    """Return ``pane`` only if it is exactly the id of a pane in scope.
+
+    Names, terminal ids, and any other alias herdr might resolve are rejected on
+    purpose: the string handed to the CLI is always one we just saw in a listing.
+    """
+    ids = _scoped_workspace_ids()
+    for p in _herdr("pane", "list").get("panes", []):
+        if p.get("pane_id") == pane and p.get("workspace_id") in ids:
+            return p["pane_id"]
+    raise ToolError(f"pane {pane!r} is not in an allowed workspace")
+
+
+def _tool(group: str):
+    """Register a tool only when its group is enabled via HERDR_MCP_TOOLS."""
+    if group in _enabled_groups():
+        return mcp.tool()
+    return lambda fn: fn
+
+
+# --------------------------------------------------------------------------
 # Inspection
 # --------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_tool("read")
 def list_workspaces() -> dict[str, Any]:
     """List Herdr workspaces with their ids, labels, and aggregate agent status.
 
     Workspace ids look like `w17`. Start here to orient in the session.
     """
-    return _herdr("workspace", "list")
+    ids = _scoped_workspace_ids()
+    listing = _herdr("workspace", "list")
+    listing["workspaces"] = [
+        w for w in listing.get("workspaces", []) if w.get("workspace_id") in ids
+    ]
+    return listing
 
 
-@mcp.tool()
+@_tool("read")
 def list_tabs() -> dict[str, Any]:
     """List tabs across the session. Tab ids look like `w17:t1`."""
-    return _herdr("tab", "list")
+    listing = _herdr("tab", "list")
+    listing["tabs"] = _scoped(listing.get("tabs", []))
+    return listing
 
 
-@mcp.tool()
+@_tool("read")
 def list_panes() -> dict[str, Any]:
     """List every pane with its id, workspace, tab, cwd, title, and agent status.
 
     Pane ids look like `w17:p1` and are the target of every pane tool.
     """
-    return _herdr("pane", "list")
+    listing = _herdr("pane", "list")
+    listing["panes"] = _scoped(listing.get("panes", []))
+    return listing
 
 
-@mcp.tool()
+@_tool("read")
 def list_agents() -> dict[str, Any]:
     """List panes running a detected coding agent, with agent kind and status.
 
     Status is one of idle, working, blocked, done, unknown. Agents are addressed
     by pane id (`w17:p1`) or by their agent name.
     """
-    return _herdr("agent", "list")
+    listing = _herdr("agent", "list")
+    listing["agents"] = _scoped(listing.get("agents", []))
+    return listing
 
 
-@mcp.tool()
+@_tool("read")
 def get_agent(target: str) -> dict[str, Any]:
     """Show one agent's current state.
 
-    target: a pane id like `w17:p1` or an agent name; get them from list_agents.
+    target: a pane id like `w17:p1` from list_agents (agent names are not accepted).
     """
-    return _herdr("agent", "get", target)
+    return _herdr("agent", "get", _require_pane(target))
 
 
-@mcp.tool()
+@_tool("read")
 def read_pane(pane: str, lines: int | None = None, source: str = "recent") -> str:
     """Read a pane's terminal output as plain text.
 
@@ -180,6 +260,7 @@ def read_pane(pane: str, lines: int | None = None, source: str = "recent") -> st
     source="visible".
     """
     _one_of("source", source, READ_SOURCES)
+    pane = _require_pane(pane)
     args = ["pane", "read", pane, "--format", "text", "--source", source]
     if lines is not None:
         if lines <= 0:
@@ -193,7 +274,7 @@ def read_pane(pane: str, lines: int | None = None, source: str = "recent") -> st
 # --------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_tool("prompt")
 def prompt_agent(
     target: str,
     text: str,
@@ -206,7 +287,7 @@ def prompt_agent(
     wait: also wait for the agent to settle (idle, done, or blocked) afterwards.
     timeout_ms: only used with wait=True; the call fails if nothing matches in time.
     """
-    args = ["agent", "prompt", target, text]
+    args = ["agent", "prompt", _require_pane(target), text]
     timeout = DEFAULT_TIMEOUT
     if wait:
         args += ["--wait", "--timeout", str(timeout_ms)]
@@ -214,7 +295,7 @@ def prompt_agent(
     return _herdr(*args, timeout=timeout)
 
 
-@mcp.tool()
+@_tool("read")
 def wait_agent(
     target: str,
     until: list[str] | None = None,
@@ -226,23 +307,23 @@ def wait_agent(
     until: any of idle, working, blocked, done, unknown. Default: idle, done, blocked.
     timeout_ms: the call fails if no requested state is observed in time.
     """
-    args = ["agent", "wait", target]
+    args = ["agent", "wait", _require_pane(target)]
     for state in until or []:
         args += ["--until", _one_of("until", state, AGENT_STATES)]
     args += ["--timeout", str(timeout_ms)]
     return _herdr(*args, timeout=_wait_timeout(timeout_ms))
 
 
-@mcp.tool()
+@_tool("input")
 def send_text(pane: str, text: str) -> dict[str, Any]:
     """Send literal text to a pane without pressing Enter.
 
     pane: pane id like `w17:p1`. Use run_command to send a command and Enter.
     """
-    return _herdr("pane", "send-text", pane, text)
+    return _herdr("pane", "send-text", _require_pane(pane), text)
 
 
-@mcp.tool()
+@_tool("input")
 def send_keys(pane: str, keys: list[str]) -> dict[str, Any]:
     """Send key presses to a pane, e.g. ["enter"], ["esc"], ["ctrl-c"].
 
@@ -250,10 +331,10 @@ def send_keys(pane: str, keys: list[str]) -> dict[str, Any]:
     """
     if not keys:
         raise ToolError("keys must contain at least one key name")
-    return _herdr("pane", "send-keys", pane, *keys)
+    return _herdr("pane", "send-keys", _require_pane(pane), *keys)
 
 
-@mcp.tool()
+@_tool("input")
 def run_command(pane: str, command: list[str]) -> dict[str, Any]:
     """Run a shell command in a pane (sends the command text and Enter).
 
@@ -263,10 +344,10 @@ def run_command(pane: str, command: list[str]) -> dict[str, Any]:
     """
     if not command:
         raise ToolError("command must contain at least one word")
-    return _herdr("pane", "run", pane, *command)
+    return _herdr("pane", "run", _require_pane(pane), *command)
 
 
-@mcp.tool()
+@_tool("read")
 def wait_for_output(
     pane: str,
     pattern: str,
@@ -282,6 +363,7 @@ def wait_for_output(
     source: visible, recent (default), or recent-unwrapped.
     """
     _one_of("source", source, WAIT_SOURCES)
+    pane = _require_pane(pane)
     flag = "--regex" if regex else "--match"
     args = [
         "pane",
@@ -302,7 +384,7 @@ def wait_for_output(
 # --------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_tool("layout")
 def split_pane(
     pane: str,
     direction: str = "right",
@@ -315,7 +397,7 @@ def split_pane(
     ratio: fraction of the split given to the new pane, between 0 and 1.
     """
     _one_of("direction", direction, SPLIT_DIRECTIONS)
-    args = ["pane", "split", pane, "--direction", direction]
+    args = ["pane", "split", _require_pane(pane), "--direction", direction]
     if ratio is not None:
         if not 0.0 < ratio < 1.0:
             raise ToolError("ratio must be between 0 and 1 (exclusive)")
@@ -323,15 +405,16 @@ def split_pane(
     return _herdr(*args)
 
 
-@mcp.tool()
+@_tool("layout")
 def close_pane(pane: str) -> dict[str, Any]:
     """Close a pane and any process running in it. pane: pane id like `w17:p1`."""
-    return _herdr("pane", "close", pane)
+    return _herdr("pane", "close", _require_pane(pane))
 
 
 def main() -> None:
     """Entry point: serve MCP over stdio."""
     logging.basicConfig(level=os.environ.get("HERDR_MCP_LOG_LEVEL", "WARNING"))
+    _scope_entries()  # fail closed at startup, not on the first call
     mcp.run()
 
 
